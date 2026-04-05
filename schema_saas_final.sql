@@ -24,7 +24,7 @@ drop type if exists categoria_enum cascade;
 drop type if exists tipo_despesa_enum cascade;
 
 -- ============================================================
---  SCHEMA FINAL — SAAS MULTI-TENANT (Com Perfis)
+--  SCHEMA FINAL — SAAS MULTI-TENANT (Com RLS nas Views!)
 -- ============================================================
 
 create extension if not exists "uuid-ossp";
@@ -49,7 +49,6 @@ create table saloes (
   criado_em   timestamptz default now()
 );
 
--- A Ponte: Liga quem logou (auth) com o Salão e seu cargo
 create table perfis_acesso (
   auth_user_id  uuid primary key references auth.users(id) on delete cascade,
   salao_id      uuid not null references saloes(id) on delete cascade,
@@ -58,11 +57,12 @@ create table perfis_acesso (
 );
 
 create table configuracoes (
-  id                        uuid primary key default uuid_generate_v4(),
-  salao_id                  uuid not null unique references saloes(id) on delete cascade,
+  id                         uuid primary key default uuid_generate_v4(),
+  salao_id                   uuid not null unique references saloes(id) on delete cascade,
   custo_fixo_por_atendimento numeric(10,2) not null default 29.00,
-  taxa_maquininha_pct       numeric(5,2)  not null default 5.00,
-  prolabore_mensal          numeric(10,2) default 0
+  taxa_maquininha_pct        numeric(5,2)  not null default 5.00,
+  prolabore_mensal           numeric(10,2) default 0,
+  gastos_pessoais            jsonb not null default '[]'   -- ← ADICIONADO
 );
 
 -- =======================
@@ -88,13 +88,12 @@ create table procedimentos (
   preco_p                  numeric(10,2),
   preco_m                  numeric(10,2),
   preco_g                  numeric(10,2),
-  custo_variavel           numeric(10,2) not null default 0,  -- Custo do produto utilizado
+  custo_variavel           numeric(10,2) not null default 0,
   porcentagem_profissional numeric(5,2)  not null default 40,
   ativo                    boolean not null default true,
   criado_em                timestamptz default now(),
-  unique(salao_id, nome) -- Evita nomes duplicados no mesmo salão
+  unique(salao_id, nome)
 );
-
 
 create table atendimentos (
   id                  uuid primary key default uuid_generate_v4(),
@@ -143,7 +142,7 @@ create index idx_homecare_data on homecare(data);
 
 create table procedimentos_paralelos (
   id              uuid primary key default uuid_generate_v4(),
-  salao_id      uuid not null references saloes(id) on delete cascade,
+  salao_id        uuid not null references saloes(id) on delete cascade,
   data            date not null,
   profissional_id uuid references profissionais(id),
   descricao       text not null,
@@ -158,7 +157,7 @@ create index idx_paralelos_data on procedimentos_paralelos(data);
 
 create table despesas (
   id          uuid primary key default uuid_generate_v4(),
-  salao_id      uuid not null references saloes(id) on delete cascade,
+  salao_id    uuid not null references saloes(id) on delete cascade,
   data        date not null,
   descricao   text not null,
   tipo        tipo_despesa_enum not null default 'OUTRO',
@@ -235,8 +234,7 @@ create trigger trg_calcular_atendimento
   before insert or update on atendimentos
   for each row execute function fn_calcular_atendimento();
 
-
--- Função Inteligente de Criação de Usuário (Avalia Cargo e Salão se existirem nos metadados!)
+-- Função Inteligente de Criação de Usuário
 create or replace function public.handle_new_user_salao()
 returns trigger
 language plpgsql
@@ -246,22 +244,18 @@ declare
   v_salao_id uuid;
   v_cargo cargo_enum;
 begin
-  -- Lê os metadados do convite (caso a dona esteja cadastrando uma funcionária)
   v_salao_id := (new.raw_user_meta_data->>'salao_id')::uuid;
-  v_cargo    := coalesce((new.raw_user_meta_data->>'cargo'), 'PROPRIETARIO');
+  v_cargo    := coalesce((new.raw_user_meta_data->>'cargo')::cargo_enum, 'PROPRIETARIO'::cargo_enum);
 
   if v_salao_id is null then
-    -- Se não mandou ID, é uma CONTA NOVA de proprietária contratando o sistema.
     insert into public.saloes (nome)
     values ('Salão de ' || coalesce(new.email, 'Usuário'))
     returning id into v_salao_id;
 
-    -- Insere configuração padrão
     insert into public.configuracoes (salao_id, custo_fixo_por_atendimento, taxa_maquininha_pct)
     values (v_salao_id, 29.00, 5.00);
   end if;
 
-  -- Insere o perfil de acesso criando a ponte.
   insert into public.perfis_acesso (auth_user_id, salao_id, cargo)
   values (new.id, v_salao_id, v_cargo);
 
@@ -275,10 +269,10 @@ create trigger on_auth_user_created
   for each row execute procedure public.handle_new_user_salao();
 
 -- =======================
---  4. VIEWS DE RESULTADO
+--  4. VIEWS DE RESULTADO (SEGURAS COM SECURITY_INVOKER)
 -- =======================
 
-create or replace view agenda_do_dia as
+create or replace view agenda_do_dia with (security_invoker = true) as
 select
   a.id, a.salao_id, a.data, a.horario, a.cliente, a.comprimento, a.valor_cobrado,
   a.valor_profissional, a.lucro_liquido, a.lucro_possivel,
@@ -291,14 +285,13 @@ join profissionais  p  on p.id  = a.profissional_id
 join procedimentos  pr on pr.id = a.procedimento_id
 order by a.data, a.horario, p.nome;
 
-create or replace view fechamento_mensal as
+create or replace view fechamento_mensal with (security_invoker = true) as
 with base as (
   select salao_id, date_trunc('month', data)::date as mes from atendimentos
   union select salao_id, date_trunc('month', data)::date from homecare
   union select salao_id, date_trunc('month', data)::date from procedimentos_paralelos
   union select salao_id, date_trunc('month', data)::date from despesas
 ),
-... [Resto das subqueries idênticas mas contendo salao_id no group by]
 atend as (
   select
     salao_id, date_trunc('month', data)::date as mes,
@@ -330,66 +323,91 @@ desp as (
   from despesas group by 1,2
 ),
 sal as (
-  select salao_id, sum(salario_fixo) as total_salarios_fixos from profissionais where ativo = true and cargo = 'FUNCIONARIO' group by salao_id
+  select salao_id, sum(salario_fixo) as total_salarios_fixos
+  from profissionais where ativo = true and cargo = 'FUNCIONARIO' group by salao_id
 )
 select
   b.salao_id,
-  b.mes, coalesce(a.receita_bruta, 0) as receita_bruta, coalesce(a.receita_recebida, 0) as receita_recebida,
-  coalesce(a.pendencias, 0) as pendencias, coalesce(a.total_maquininha, 0) as total_maquininha,
-  coalesce(a.total_profissionais, 0) as total_profissionais, coalesce(a.total_custo_fixo, 0) as total_custo_fixo,
-  coalesce(a.total_custo_variavel,0) as total_custo_variavel, coalesce(a.lucro_liquido, 0) as lucro_liquido_atendimentos,
-  coalesce(a.lucro_possivel, 0) as lucro_possivel_atendimentos, coalesce(a.total_atendimentos, 0) as total_atendimentos,
-  coalesce(a.total_cancelamentos, 0) as total_cancelamentos, coalesce(h.receita_homecare, 0) as receita_homecare,
-  coalesce(h.lucro_homecare, 0) as lucro_homecare, coalesce(h.pendente_homecare, 0) as pendente_homecare,
-  coalesce(p.receita_paralelos, 0) as receita_paralelos, coalesce(p.pendente_paralelos, 0) as pendente_paralelos,
-  coalesce(d.total_despesas, 0) as total_despesas, coalesce(s.total_salarios_fixos,0) as total_salarios_fixos,
-  coalesce(a.receita_bruta, 0) + coalesce(h.receita_homecare, 0) + coalesce(p.receita_paralelos,0) as receita_total,
+  b.mes,
+  coalesce(a.receita_bruta, 0)            as receita_bruta,
+  coalesce(a.receita_recebida, 0)         as receita_recebida,
+  coalesce(a.pendencias, 0)               as pendencias,
+  coalesce(a.total_maquininha, 0)         as total_maquininha,
+  coalesce(a.total_profissionais, 0)      as total_profissionais,
+  coalesce(a.total_custo_fixo, 0)         as total_custo_fixo,
+  coalesce(a.total_custo_variavel, 0)     as total_custo_variavel,
+  coalesce(a.lucro_liquido, 0)            as lucro_liquido_atendimentos,
+  coalesce(a.lucro_possivel, 0)           as lucro_possivel_atendimentos,
+  coalesce(a.total_atendimentos, 0)       as total_atendimentos,
+  coalesce(a.total_cancelamentos, 0)      as total_cancelamentos,
+  coalesce(h.receita_homecare, 0)         as receita_homecare,
+  coalesce(h.lucro_homecare, 0)           as lucro_homecare,
+  coalesce(h.pendente_homecare, 0)        as pendente_homecare,
+  coalesce(p.receita_paralelos, 0)        as receita_paralelos,
+  coalesce(p.pendente_paralelos, 0)       as pendente_paralelos,
+  coalesce(d.total_despesas, 0)           as total_despesas,
+  coalesce(s.total_salarios_fixos, 0)     as total_salarios_fixos,
+  coalesce(a.receita_bruta, 0) + coalesce(h.receita_homecare, 0) + coalesce(p.receita_paralelos, 0) as receita_total,
   coalesce(a.lucro_liquido, 0) + coalesce(h.lucro_homecare, 0) - coalesce(d.total_despesas, 0) - coalesce(s.total_salarios_fixos, 0) as saude_financeira
 from base b
 left join atend a on a.salao_id = b.salao_id and a.mes = b.mes
-left join hc h on h.salao_id = b.salao_id and h.mes = b.mes
-left join pp p on p.salao_id = b.salao_id and p.mes = b.mes
-left join desp d on d.salao_id = b.salao_id and d.mes = b.mes
-left join sal s on s.salao_id = b.salao_id
+left join hc    h on h.salao_id = b.salao_id and h.mes = b.mes
+left join pp    p on p.salao_id = b.salao_id and p.mes = b.mes
+left join desp  d on d.salao_id = b.salao_id and d.mes = b.mes
+left join sal   s on s.salao_id = b.salao_id
 order by b.mes desc;
 
+-- ← ADICIONADO: view ranking_procedimentos
+create or replace view ranking_procedimentos with (security_invoker = true) as
+select
+  a.salao_id,
+  date_trunc('month', a.data)::date as mes,
+  pr.nome as procedimento,
+  count(*) filter (where a.status <> 'CANCELADO') as quantidade,
+  sum(a.valor_cobrado) filter (where a.status <> 'CANCELADO') as receita_total,
+  sum(a.lucro_liquido) filter (where a.status <> 'CANCELADO') as lucro_total,
+  round(
+    sum(a.valor_cobrado) filter (where a.status <> 'CANCELADO') /
+    nullif(count(*) filter (where a.status <> 'CANCELADO'), 0)
+  , 2) as ticket_medio
+from atendimentos a
+join procedimentos pr on pr.id = a.procedimento_id
+group by a.salao_id, date_trunc('month', a.data)::date, pr.nome;
+
+-- ← ADICIONADO: view rendimento_por_profissional
+create or replace view rendimento_por_profissional with (security_invoker = true) as
+select
+  a.salao_id,
+  date_trunc('month', a.data)::date as mes,
+  p.nome as profissional,
+  count(*) filter (where a.status <> 'CANCELADO') as total_atendimentos,
+  sum(a.valor_cobrado) filter (where a.status <> 'CANCELADO') as receita_gerada,
+  sum(a.valor_profissional) filter (where a.status <> 'CANCELADO') as rendimento_variavel,
+  p.salario_fixo,
+  sum(a.valor_profissional) filter (where a.status <> 'CANCELADO') + p.salario_fixo as rendimento_total
+from atendimentos a
+join profissionais p on p.id = a.profissional_id
+group by a.salao_id, date_trunc('month', a.data)::date, p.nome, p.salario_fixo;
+
 -- =======================
---  5. SEGURANÇA MAXIMA (RLS) USANDO O PERFIL LOGADO
+--  5. SEGURANÇA MÁXIMA (RLS)
 -- =======================
-alter table saloes                   enable row level security;
-alter table perfis_acesso            enable row level security;
-alter table configuracoes            enable row level security;
-alter table profissionais            enable row level security;
-alter table procedimentos            enable row level security;
-alter table atendimentos             enable row level security;
-alter table homecare                 enable row level security;
-alter table procedimentos_paralelos  enable row level security;
-alter table despesas                 enable row level security;
+alter table saloes                  enable row level security;
+alter table perfis_acesso           enable row level security;
+alter table configuracoes           enable row level security;
+alter table profissionais           enable row level security;
+alter table procedimentos           enable row level security;
+alter table atendimentos            enable row level security;
+alter table homecare                enable row level security;
+alter table procedimentos_paralelos enable row level security;
+alter table despesas                enable row level security;
 
--- O usuário só lê os saloes cujos IDs estejam no seu perfil
-create policy "Saloes isolation" on saloes for all to authenticated using (id in (select salao_id from perfis_acesso where auth_user_id = auth.uid()));
-
--- O usuário gerencia seu próprio perfil (Read)
-create policy "Read own profile" on perfis_acesso for select to authenticated using (auth_user_id = auth.uid());
-
--- Restante: O dado pertence ao salão que o usuário logado tem no seu perfil_acesso
-create policy "Isolar configuracoes" on configuracoes for all to authenticated 
-using (salao_id in (select salao_id from perfis_acesso where auth_user_id = auth.uid()));
-
-create policy "Isolar profs" on profissionais for all to authenticated 
-using (salao_id in (select salao_id from perfis_acesso where auth_user_id = auth.uid()));
-
-create policy "Isolar procs" on procedimentos for all to authenticated 
-using (salao_id in (select salao_id from perfis_acesso where auth_user_id = auth.uid()));
-
-create policy "Isolar atendim" on atendimentos for all to authenticated 
-using (salao_id in (select salao_id from perfis_acesso where auth_user_id = auth.uid()));
-
-create policy "Isolar homecare" on homecare for all to authenticated 
-using (salao_id in (select salao_id from perfis_acesso where auth_user_id = auth.uid()));
-
-create policy "Isolar parale" on procedimentos_paralelos for all to authenticated 
-using (salao_id in (select salao_id from perfis_acesso where auth_user_id = auth.uid()));
-
-create policy "Isolar despes" on despesas for all to authenticated 
-using (salao_id in (select salao_id from perfis_acesso where auth_user_id = auth.uid()));
+create policy "Saloes isolation"    on saloes for all to authenticated using (id in (select salao_id from perfis_acesso where auth_user_id = auth.uid()));
+create policy "Read own profile"    on perfis_acesso for select to authenticated using (auth_user_id = auth.uid());
+create policy "Isolar configuracoes" on configuracoes for all to authenticated using (salao_id in (select salao_id from perfis_acesso where auth_user_id = auth.uid()));
+create policy "Isolar profs"        on profissionais for all to authenticated using (salao_id in (select salao_id from perfis_acesso where auth_user_id = auth.uid()));
+create policy "Isolar procs"        on procedimentos for all to authenticated using (salao_id in (select salao_id from perfis_acesso where auth_user_id = auth.uid()));
+create policy "Isolar atendim"      on atendimentos for all to authenticated using (salao_id in (select salao_id from perfis_acesso where auth_user_id = auth.uid()));
+create policy "Isolar homecare"     on homecare for all to authenticated using (salao_id in (select salao_id from perfis_acesso where auth_user_id = auth.uid()));
+create policy "Isolar parale"       on procedimentos_paralelos for all to authenticated using (salao_id in (select salao_id from perfis_acesso where auth_user_id = auth.uid()));
+create policy "Isolar despes"       on despesas for all to authenticated using (salao_id in (select salao_id from perfis_acesso where auth_user_id = auth.uid()));

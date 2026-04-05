@@ -75,17 +75,31 @@ export default function Agenda() {
 
   const carregarEstaticos = useCallback(async () => {
     if (!salaoId) return;
+
+    // Cache de 1h no sessionStorage — profissionais e procedimentos raramente mudam
+    const chave = `estaticos_${salaoId}`;
+    const cache = sessionStorage.getItem(chave);
+    if (cache) {
+      const { profs, procs, ts } = JSON.parse(cache);
+      if (Date.now() - ts < 3600000) {
+        setProfissionais(profs);
+        setProcedimentos(procs);
+        return;
+      }
+    }
+
     const [{ data: profs }, { data: procs }] = await Promise.all([
       supabase.from('profissionais').select('*').eq('salao_id', salaoId).eq('ativo', true).order('nome'),
       supabase.from('procedimentos').select('*').eq('salao_id', salaoId).eq('ativo', true).order('nome'),
     ]);
     if (profs) setProfissionais(profs);
     if (procs) setProcedimentos(procs);
+    if (profs && procs) sessionStorage.setItem(chave, JSON.stringify({ profs, procs, ts: Date.now() }));
   }, [salaoId]);
 
-  const carregarAtendimentos = useCallback(async (data) => {
+  const carregarAtendimentos = useCallback(async (data, silencioso = false) => {
     if (!salaoId) return;
-    setLoading(true);
+    if (!silencioso) setLoading(true);
     const { data: aten } = await supabase
       .from('atendimentos')
       .select(`*, procedimentos(nome, requer_comprimento), profissionais(nome)`)
@@ -123,7 +137,7 @@ export default function Agenda() {
     e.preventDefault();
     setSalvando(true);
     const { error } = await supabase.from('atendimentos').insert([{
-      salao_id:         salaoId, // Injeção de Segurança
+      salao_id:         salaoId,
       data:             toISO(dataSelecionada),
       horario:          slotSelecionado.horario,
       profissional_id:  slotSelecionado.profissional.id,
@@ -136,31 +150,31 @@ export default function Agenda() {
     setSalvando(false);
     if (error) { alert('Erro ao salvar: ' + error.message); return; }
     setModalAberto(false);
-    carregarAtendimentos(dataSelecionada);
+    carregarAtendimentos(dataSelecionada, true);
   };
 
   const marcarPago = async (id, pago) => {
-    await supabase.from('atendimentos').update({ pago: !pago }).eq('id', id);
-    carregarAtendimentos(dataSelecionada);
     setDetalheAberto(false);
+    await supabase.from('atendimentos').update({ pago: !pago }).eq('id', id);
+    carregarAtendimentos(dataSelecionada, true);
   };
 
   const marcarExecutado = async (id, executado) => {
     const novoStatus = !executado ? 'EXECUTADO' : 'AGENDADO';
+    setDetalheAberto(false);
     await supabase.from('atendimentos')
       .update({ executado: !executado, status: novoStatus })
       .eq('id', id);
-    carregarAtendimentos(dataSelecionada);
-    setDetalheAberto(false);
+    carregarAtendimentos(dataSelecionada, true);
   };
 
   const cancelarAtendimento = async (id) => {
     if (!confirm('Cancelar este atendimento?')) return;
+    setDetalheAberto(false);
     await supabase.from('atendimentos')
       .update({ status: 'CANCELADO', pago: false, executado: false })
       .eq('id', id);
-    carregarAtendimentos(dataSelecionada);
-    setDetalheAberto(false);
+    carregarAtendimentos(dataSelecionada, true);
   };
 
   // ── Helpers de UI ────────────────────────────────────────────────────────
@@ -336,17 +350,30 @@ export default function Agenda() {
                   <option value="">Selecione na tabela...</option>
                   {procedimentos.map(p => <option key={p.id} value={p.id}>{p.nome}</option>)}
                 </select>
+
+                {/* Preview de preço */}
+                {procSelecionado && (
+                  <div className="mt-3 bg-blue-50 border border-blue-200 rounded-lg px-3 py-2.5">
+                    <div className="flex justify-between items-center">
+                      <span className="text-xs font-bold text-blue-700">✓ Preço sugerido</span>
+                      <span className="text-lg font-black text-blue-900">
+                        R$ {(procSelecionado.preco_p || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                      </span>
+                    </div>
+                    <p className="text-[10px] text-blue-600 mt-1">(Pode ser editado abaixo)</p>
+                  </div>
+                )}
               </div>
 
               {requerComprimento && (
                 <div>
-                  <label className="block text-xs font-bold text-gray-700 mb-1.5 uppercase tracking-wide">Tamanho do cabelo</label>
+                  <label className="block text-xs font-bold text-gray-700 mb-2 uppercase tracking-wide">Tamanho do cabelo</label>
                   <div className="flex gap-2">
                     {['P','M','G'].map(c => (
                       <button
                         key={c} type="button"
                         onClick={() => setComprimento(c)}
-                        className={`flex-1 py-2 text-sm font-semibold rounded-xl border transition-all ${
+                        className={`flex-1 py-2.5 text-sm font-bold rounded-xl border transition-all ${
                           comprimento === c
                             ? 'bg-gray-900 text-white border-gray-900 shadow-md ring-2 ring-gray-900 ring-offset-2'
                             : 'border-gray-200 text-gray-500 hover:border-gray-400 hover:bg-gray-50'
@@ -360,16 +387,22 @@ export default function Agenda() {
               )}
 
               <div>
-                <label className="block text-xs font-bold text-gray-700 mb-1.5 uppercase tracking-wide flex justify-between">
-                  Valor cobrado (R$)
-                  {valorCobrado && <span className="text-gray-400 font-normal lowercase tracking-normal">automático</span>}
-                </label>
+                <label className="block text-xs font-bold text-gray-700 mb-1.5 uppercase tracking-wide">Valor cobrado (R$)</label>
                 <input
                   type="number" step="0.01" min="0"
                   value={valorCobrado} onChange={e => setValorCobrado(e.target.value)}
                   className="w-full border border-gray-200 bg-gray-50 rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-gray-900 focus:bg-white transition-all shadow-inner"
                   placeholder="0,00"
                 />
+                {valorCobrado && (
+                  <div className="mt-2 text-xs text-gray-600 bg-gray-50 px-3 py-2 rounded-lg">
+                    <p className="text-center font-bold text-gray-700">Lucro estimado</p>
+                    <p className="text-center text-lg font-black text-green-700 mt-1">
+                      R$ {(Number(valorCobrado) * 0.95 * 0.6 - 29).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                    </p>
+                    <p className="text-[10px] text-gray-500 text-center mt-1">Taxa maq. 5% | Comissão prof. 40% | Custo fixo R$29</p>
+                  </div>
+                )}
               </div>
 
               <div className="flex gap-3 pt-4">
