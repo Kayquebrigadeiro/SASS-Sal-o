@@ -160,11 +160,23 @@ export default function NovoSalao({ userId }) {
             nome: loginProprietaria.nome || proprietaria?.nome,
             salao_id: salao.id,
             cargo: 'PROPRIETARIO'
-          }
+          },
+          emailRedirectTo: window.location.origin
         }
       });
 
       if (authError) throw authError;
+
+      // 7. Criar perfil de acesso da proprietária
+      if (authData?.user) {
+        await supabase.from('perfis_acesso').insert([{
+          user_id: authData.user.id,
+          email: loginProprietaria.email,
+          tipo_acesso: 'proprietaria',
+          salao_id: salao.id,
+          nome: loginProprietaria.nome || proprietaria?.nome
+        }]);
+      }
 
       alert(`✅ Salão "${dadosSalao.nome}" criado com sucesso!\n\nCredenciais da proprietária:\nEmail: ${loginProprietaria.email}\nSenha: ${loginProprietaria.senha}\n\nGuarde essas informações!`);
       navigate('/admin/saloes');
