@@ -1,314 +1,310 @@
-import { useState, useEffect } from 'react';
+import React, { useState, useEffect } from 'react';
 import { supabase } from '../supabaseClient';
-import { BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from 'recharts';
+import { useAuth } from '../hooks/useAuth';
+import { 
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
+  Cell, ReferenceLine, ComposedChart, Line, Legend
+} from 'recharts';
 
-const MESES = ['Jan','Fev','Mar','Abr','Mai','Jun','Jul','Ago','Set','Out','Nov','Dez'];
-
-function fmt(val) {
-  return Number(val || 0).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
-}
-
-function Card({ label, valor, cor, variacao }) {
-  return (
-    <div className="bg-white rounded-xl border border-gray-200 p-5">
-      <div className="flex items-start justify-between">
-        <div>
-          <p className="text-xs text-gray-500 mb-1">{label}</p>
-          <p className={`text-2xl font-semibold ${cor || 'text-gray-800'}`}>{fmt(valor)}</p>
-        </div>
-        {variacao !== undefined && (
-          <div className={`text-xs font-bold px-2 py-1 rounded-full ${variacao >= 0 ? 'bg-green-50 text-green-700' : 'bg-red-50 text-red-700'}`}>
-            {variacao >= 0 ? '▲' : '▼'} {Math.abs(variacao).toFixed(1)}%
-          </div>
-        )}
-      </div>
-    </div>
-  );
-}
-
-export default function Dashboard({ salaoId }) {
-  const hoje = new Date();
-  const [ano, setAno] = useState(hoje.getFullYear());
-  const [mes, setMes] = useState(hoje.getMonth() + 1);
-  const [dados, setDados] = useState(null);
-  const [historico, setHistorico] = useState([]);
-  const [ranking, setRanking] = useState([]);
-  const [rendimento, setRendimento] = useState([]);
-  const [pendentes, setPendentes] = useState([]);
+const Dashboard = () => {
+  const { salaoId, loading: authLoading } = useAuth();
   const [loading, setLoading] = useState(true);
+  const [alertasPrejuizo, setAlertasPrejuizo] = useState([]);
+  const [dados, setDados] = useState({
+    faturamentoMensal: [],
+    rankingPossivel: [],
+    lucroReal: [],
+    rendimentoEquipe: [],
+    comparativoGeral: [],
+    kpis: { bruto: 0, possivel: 0, real: 0 }
+  });
 
-  useEffect(() => {
-    if (!salaoId) return;
-    carregar();
-  }, [salaoId, ano, mes]);
-
-  const mesISO = `${ano}-${String(mes).padStart(2,'0')}-01`;
-
-  const carregar = async () => {
-    setLoading(true);
-
-    const [
-      { data: fechamento },
-      { data: hist },
-      { data: rank },
-      { data: rend },
-      { data: pend },
-    ] = await Promise.all([
-      supabase.from('fechamento_mensal').select('*').eq('salao_id', salaoId).eq('mes', mesISO).single(),
-      supabase.from('fechamento_mensal').select('mes,receita_bruta,lucro_liquido_atendimentos,lucro_possivel_atendimentos').eq('salao_id', salaoId).order('mes', { ascending: false }).limit(6),
-      supabase.from('ranking_procedimentos').select('*').eq('salao_id', salaoId).eq('mes', mesISO).order('receita_total', { ascending: false }),
-      supabase.from('rendimento_por_profissional').select('*').eq('salao_id', salaoId).eq('mes', mesISO).order('receita_gerada', { ascending: false }),
-      supabase.from('atendimentos').select('cliente, valor_cobrado, procedimentos(nome), horario').eq('salao_id', salaoId).gte('data', mesISO).lt('data', `${ano}-${String(mes+1).padStart(2,'0')}-01`).eq('executado', true).eq('pago', false).neq('status', 'CANCELADO'),
-    ]);
-
-    setDados(fechamento || {});
-    setHistorico((hist || []).reverse());
-    setRanking(rank || []);
-    setRendimento(rend || []);
-    setPendentes(pend || []);
-    setLoading(false);
+  // Cores da sua Planilha
+  const COLORS = {
+    primary: '#E85D24', // Laranja/Vermelho principal
+    danger: '#A32D2D',  // Vermelho escuro de prejuízo
+    teta: '#BA7517',    // Destaque da Teta
+    light: '#E6F1FB'
   };
 
-  const maxReceita = Math.max(...historico.map(h => Number(h.receita_bruta || 0)), 1);
-  
-  // Calcular variação com mês anterior
-  const mesAnterior = historico.slice(1, 2)[0];
-  const variacaoReceita = mesAnterior && Number(dados?.receita_total || 0) > 0 
-    ? (((Number(dados?.receita_total) - Number(mesAnterior.receita_bruta)) / Number(mesAnterior.receita_bruta)) * 100)
-    : undefined;
+  const fmt = (val) => Number(val || 0).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 
-  const variacaoLucro = mesAnterior && Number(dados?.lucro_liquido_atendimentos || 0) > 0
-    ? (((Number(dados?.lucro_liquido_atendimentos) - Number(mesAnterior.lucro_liquido_atendimentos)) / Number(mesAnterior.lucro_liquido_atendimentos)) * 100)
-    : undefined;
+
+  useEffect(() => {
+    if (authLoading || !salaoId) return;
+    fetchDadosSaaS();
+  }, [salaoId, authLoading]);
+
+  const fetchDadosSaaS = async () => {
+    setLoading(true);
+    try {
+      // 1. Faturamento Mensal (últimos 9 meses)
+      const { data: atendimentos } = await supabase
+        .from('atendimentos')
+        .select('data, valor_cobrado, procedimentos(nome), profissionais(nome)')
+        .eq('salao_id', salaoId)
+        .eq('executado', true)
+        .neq('status', 'CANCELADO');
+
+      // 2. Agregar por mês
+      const faturamentoMap = {};
+      (atendimentos || []).forEach(a => {
+        if (!a.data || !a.valor_cobrado) return;
+        const mes = new Date(a.data).toLocaleString('pt-BR', { month: 'short', year: '2-digit' }).slice(0, 3).toLowerCase();
+        if (!faturamentoMap[mes]) faturamentoMap[mes] = { mes, valor: 0, qtd: 0 };
+        faturamentoMap[mes].valor += Number(a.valor_cobrado);
+        faturamentoMap[mes].qtd += 1;
+      });
+      const faturamentoMensal = Object.values(faturamentoMap).slice(-9);
+
+      // 3. Buscar configurações
+      const { data: config } = await supabase
+        .from('configuracoes')
+        .select('custo_fixo_por_atendimento, taxa_maquininha_pct')
+        .eq('salao_id', salaoId)
+        .single();
+
+      const custoFixo = Number(config?.custo_fixo_por_atendimento || 29);
+      const taxaMaq = Number(config?.taxa_maquininha_pct || 5) / 100;
+      const comissaoPadrao = 0.60; // 60% para funcionárias
+
+      // 4. Função para calcular lucro real (conforme planilha)
+      const calcularLucroReal = (valorBruto) => {
+        const maquininha = valorBruto * taxaMaq;
+        const valorBaseComissao = valorBruto - maquininha;
+        const comissao = valorBaseComissao * comissaoPadrao;
+        const lucro = valorBruto - maquininha - custoFixo - comissao;
+        return lucro;
+      };
+
+      // 5. Lucro Possível (sem maquininha, com custo fixo e comissão)
+      const calcularLucroPossivel = (valorBruto) => {
+        const valorBaseComissao = valorBruto;
+        const comissao = valorBaseComissao * comissaoPadrao;
+        const lucro = valorBruto - custoFixo - comissao;
+        return lucro;
+      };
+
+      // 6. Ranking por procedimento (lucro possível)
+      const rankingMap = {};
+      (atendimentos || []).forEach(a => {
+        if (!a.procedimentos?.nome || !a.valor_cobrado) return;
+        const nome = a.procedimentos.nome;
+        if (!rankingMap[nome]) rankingMap[nome] = 0;
+        rankingMap[nome] += calcularLucroPossivel(Number(a.valor_cobrado));
+      });
+      const rankingPossivel = Object.entries(rankingMap)
+        .map(([nome, valor]) => ({ nome, valor: Math.round(valor * 100) / 100 }))
+        .sort((a, b) => b.valor - a.valor)
+        .slice(0, 10);
+
+      // 7. Lucro Real por procedimento (com todos os custos)
+      const lucroRealMap = {};
+      const servicosComPrejuizo = [];
+      (atendimentos || []).forEach(a => {
+        if (!a.procedimentos?.nome || !a.valor_cobrado) return;
+        const nome = a.procedimentos.nome;
+        const lucroPorServico = calcularLucroReal(Number(a.valor_cobrado));
+        if (!lucroRealMap[nome]) lucroRealMap[nome] = 0;
+        lucroRealMap[nome] += lucroPorServico;
+        // Detectar serviços com prejuízo
+        if (lucroPorServico < 0) {
+          servicosComPrejuizo.push({ procedimento: nome, lucro: lucroPorServico, valor: Number(a.valor_cobrado) });
+        }
+      });
+      const lucroReal = Object.entries(lucroRealMap)
+        .map(([nome, valor]) => ({ nome, valor: Math.round(valor * 100) / 100 }))
+        .sort((a, b) => b.valor - a.valor)
+        .slice(0, 10);
+      
+      // Agrupar alertas por procedimento para evitar duplicatas
+      const alertasUnicos = Array.from(new Set(servicosComPrejuizo.map(s => s.procedimento)));
+      setAlertasPrejuizo(alertasUnicos);
+
+      // 8. Rendimento por profissional (apenas faturamento bruto)
+      const rendimentoMap = {};
+      (atendimentos || []).forEach(a => {
+        if (!a.profissionais?.nome || !a.valor_cobrado) return;
+        const nome = a.profissionais.nome;
+        const valor = Number(a.valor_cobrado);
+        if (!rendimentoMap[nome]) rendimentoMap[nome] = 0;
+        rendimentoMap[nome] += valor;
+      });
+      const rendimentoEquipe = Object.entries(rendimentoMap)
+        .map(([nome, valor]) => ({ nome, valor: Math.round(valor * 100) / 100 }))
+        .sort((a, b) => b.valor - a.valor);
+
+      // 9. KPIs
+      const totalBruto = (atendimentos || []).reduce((sum, a) => sum + Number(a.valor_cobrado || 0), 0);
+      const totalLucroPossivel = (atendimentos || []).reduce((sum, a) => sum + calcularLucroPossivel(Number(a.valor_cobrado || 0)), 0);
+      const totalLucroReal = (atendimentos || []).reduce((sum, a) => sum + calcularLucroReal(Number(a.valor_cobrado || 0)), 0);
+
+      // 10. Comparativo
+      const comparativoGeral = [
+        { label: 'Lucro possível', valor: Math.round(totalLucroPossivel * 100) / 100 },
+        { label: 'Lucro real', valor: Math.round(totalLucroReal * 100) / 100 }
+      ];
+
+      setDados({
+        kpis: { bruto: totalBruto, possivel: totalLucroPossivel, real: totalLucroReal },
+        faturamentoMensal,
+        rankingPossivel,
+        lucroReal,
+        rendimentoEquipe,
+        comparativoGeral
+      });
+    } catch (e) { 
+      console.error('Erro ao buscar dados:', e); 
+    } finally { 
+      setLoading(false); 
+    }
+  };
+
+
+  if (loading || authLoading || !salaoId) return <div className="p-10 text-center text-gray-400">Processando fechamento...</div>;
 
   return (
-    <div className="p-6 max-w-6xl">
-      {/* Header */}
-      <div className="flex items-center gap-4 mb-6">
-        <h1 className="text-xl font-semibold text-gray-800">Dashboard</h1>
-        <div className="flex items-center gap-2 ml-auto">
-          <select
-            value={mes}
-            onChange={e => setMes(Number(e.target.value))}
-            className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm"
-          >
-            {MESES.map((m, i) => <option key={i} value={i+1}>{m}</option>)}
-          </select>
-          <select
-            value={ano}
-            onChange={e => setAno(Number(e.target.value))}
-            className="border border-gray-200 rounded-lg px-3 py-1.5 text-sm"
-          >
-            {[2023,2024,2025,2026].map(a => <option key={a}>{a}</option>)}
-          </select>
+    <div className="bg-white min-h-screen p-4 md:p-8 font-sans">
+      
+      {/* BANNER DE ALERTA CRÍTICO */}
+      {alertasPrejuizo.length > 0 && (
+        <div className="mb-8 bg-red-600 text-white p-5 rounded-2xl shadow-lg border-4 border-red-800 animate-bounce">
+          <div className="flex items-center justify-between flex-col md:flex-row gap-4">
+            <div className="flex items-center gap-3">
+              <span className="text-4xl">🚨</span>
+              <div>
+                <h3 className="text-xl font-bold uppercase tracking-tighter">
+                  Alerta de Sangramento de Caixa!
+                </h3>
+                <p className="text-red-100 text-sm">
+                  Os procedimentos abaixo estão custando mais caro do que o valor cobrado:
+                </p>
+                <div className="flex flex-wrap gap-2 mt-2">
+                  {alertasPrejuizo.map(nome => (
+                    <span key={nome} className="bg-white text-red-700 px-3 py-1 rounded-full text-xs font-bold shadow-sm">
+                      {nome}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            </div>
+            <div className="text-right text-xs opacity-80">
+              <p>Ajuste os preços ou reduza o custo de material imediatamente.</p>
+            </div>
+          </div>
+        </div>
+      )}
+      
+      {/* KPIs DO TOPO (Estilo Field da Planilha) */}
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-10">
+        <div className="bg-gray-50 p-4 rounded-xl border border-gray-100">
+          <p className="text-[11px] uppercase tracking-wider text-gray-500 font-bold">Total faturado bruto</p>
+          <p className="text-2xl font-semibold text-gray-900 mt-1">R$ {fmt(dados.kpis.bruto)}</p>
+        </div>
+        <div className="bg-gray-50 p-4 rounded-xl border border-gray-100">
+          <p className="text-[11px] uppercase tracking-wider text-gray-500 font-bold">Lucro possível</p>
+          <p className="text-2xl font-semibold text-gray-900 mt-1 text-gray-400">R$ {fmt(dados.kpis.possivel)}</p>
+        </div>
+        <div className="bg-gray-50 p-4 rounded-xl border border-gray-100 ring-2 ring-emerald-500/20">
+          <p className="text-[11px] uppercase tracking-wider text-emerald-600 font-bold">Lucro real</p>
+          <p className="text-2xl font-semibold text-emerald-700 mt-1">R$ {fmt(dados.kpis.real)}</p>
         </div>
       </div>
 
-      {loading ? (
-        <p className="text-gray-400 text-sm">Carregando...</p>
-      ) : (
-        <>
-          {/* Cards de métricas */}
-          <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-6">
-            <Card label="Receita total" valor={dados?.receita_total} variacao={variacaoReceita} />
-            <Card label="Receita recebida" valor={dados?.receita_recebida} cor="text-green-700" />
-            <Card label="Pendências" valor={dados?.pendencias} cor="text-yellow-600" />
-            <Card
-              label="Saúde financeira"
-              valor={dados?.saude_financeira}
-              cor={Number(dados?.saude_financeira || 0) >= 0 ? 'text-green-700' : 'text-red-600'}
-              variacao={variacaoLucro}
-            />
-          </div>
-
-          {/* Histórico com Recharts */}
-          {historico.length > 0 && (
-            <div className="bg-white rounded-xl border border-gray-200 p-5 mb-6">
-              <p className="text-sm font-medium text-gray-700 mb-4">Receita vs Lucro — últimos meses</p>
-              <ResponsiveContainer width="100%" height={300}>
-                <BarChart data={historico.map(h => ({
-                  mes: MESES[new Date(h.mes).getMonth()],
-                  receita: Number(h.receita_bruta || 0),
-                  lucro: Number(h.lucro_liquido_atendimentos || 0),
-                }))}>
-                  <XAxis dataKey="mes" />
-                  <YAxis />
-                  <Tooltip 
-                    formatter={(value) => fmt(value)}
-                    contentStyle={{ backgroundColor: '#fff', border: '1px solid #ccc', borderRadius: '8px' }}
-                  />
-                  <Legend />
-                  <Bar dataKey="receita" fill="#808080" name="Receita Bruta" radius={[8, 8, 0, 0]} />
-                  <Bar dataKey="lucro" fill="#22c55e" name="Lucro Líquido" radius={[8, 8, 0, 0]} />
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-10">
+        
+        {/* GRÁFICO 1 — Faturamento Mensal */}
+        <section>
+          <h2 className="text-[13px] font-medium text-gray-400 uppercase tracking-widest border-b pb-2 mb-4">Gráfico 1 — Valor faturado bruto por mês</h2>
+          <div className="bg-white border border-gray-100 rounded-xl p-5">
+            <h3 className="text-base font-medium text-gray-800">Faturamento + Quantidade</h3>
+            <div className="h-64 mt-4">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={dados.faturamentoMensal}>
+                  <CartesianGrid strokeDasharray="3 3" vertical={false} stroke="#f0f0f0" />
+                  <XAxis dataKey="mes" axisLine={false} tickLine={false} tick={{fontSize: 12, fill: '#999'}} />
+                  <YAxis axisLine={false} tickLine={false} tick={{fontSize: 12, fill: '#999'}} tickFormatter={v => `R$${v/1000}k`} />
+                  <Tooltip cursor={{fill: '#f8f8f8'}} formatter={(v) => [`R$ ${v.toLocaleString()}`, 'Faturamento']} />
+                  <Bar dataKey="valor" fill={COLORS.primary} radius={[4, 4, 0, 0]} label={{ position: 'top', fill: '#E85D24', fontSize: 10, formatter: (v, i) => `${dados.faturamentoMensal[i.index].qtd} at.` }} />
                 </BarChart>
               </ResponsiveContainer>
             </div>
-          )}
-
-          {/* Lucro real vs possível */}
-          <div className="grid grid-cols-2 gap-4 mb-6">
-            <div className="bg-white rounded-xl border border-gray-200 p-5">
-              <p className="text-xs text-gray-500 mb-1">Lucro líquido (real)</p>
-              <p className={`text-2xl font-semibold ${Number(dados?.lucro_liquido_atendimentos || 0) >= 0 ? 'text-green-700' : 'text-red-600'}`}>
-                {fmt(dados?.lucro_liquido_atendimentos)}
-              </p>
-              <p className="text-xs text-gray-400 mt-1">Após maquininha, comissões e custos</p>
-            </div>
-            <div className="bg-white rounded-xl border border-gray-200 p-5">
-              <p className="text-xs text-gray-500 mb-1">Lucro possível (sem maquininha)</p>
-              <p className="text-2xl font-semibold text-blue-700">{fmt(dados?.lucro_possivel_atendimentos)}</p>
-              <p className="text-xs text-gray-400 mt-1">Se todos pagassem em dinheiro/pix</p>
-            </div>
           </div>
+        </section>
 
-          {/* Custos detalhados */}
-          <div className="bg-white rounded-xl border border-gray-200 p-5 mb-6">
-            <p className="text-sm font-medium text-gray-700 mb-4">Custos e deduções do mês</p>
-            <div className="space-y-2 text-sm">
-              {[
-                ['Maquininha (5%)', dados?.total_maquininha],
-                ['Comissões profissionais', dados?.total_profissionais],
-                ['Custo fixo por atendimento (R$29)', dados?.total_custo_fixo],
-                ['Custo variável (produtos)', dados?.total_custo_variavel],
-                ['Despesas lançadas', dados?.total_despesas],
-                ['Salários fixos', dados?.total_salarios_fixos],
-              ].map(([label, val]) => (
-                <div key={label} className="flex justify-between py-1 border-b border-gray-50 last:border-0">
-                  <span className="text-gray-600">{label}</span>
-                  <span className="font-medium text-red-600">{fmt(val)}</span>
-                </div>
-              ))}
-              <div className="flex justify-between pt-2 font-semibold">
-                <span>Total de custos</span>
-                <span className="text-red-700">
-                  {fmt(
-                    [dados?.total_maquininha, dados?.total_profissionais, dados?.total_custo_fixo,
-                     dados?.total_custo_variavel, dados?.total_despesas, dados?.total_salarios_fixos]
-                    .reduce((s, v) => s + Number(v || 0), 0)
-                  )}
-                </span>
+        {/* GRÁFICO 3 — Lucro Real (Com alerta de barras negativas) */}
+        <section>
+          <h2 className="text-[13px] font-medium text-gray-400 uppercase tracking-widest border-b pb-2 mb-4">Gráfico 3 — Lucro real por procedimento</h2>
+          <div className="bg-white border border-gray-100 rounded-xl p-5">
+            <h3 className="text-base font-medium text-gray-800">O que cada serviço realmente deu de lucro</h3>
+            <div className="h-64 mt-4">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={dados.lucroReal} layout="vertical">
+                  <CartesianGrid strokeDasharray="3 3" horizontal={false} stroke="#f0f0f0" />
+                  <XAxis type="number" axisLine={false} tickLine={false} tick={{fontSize: 10}} />
+                  <YAxis dataKey="nome" type="category" width={90} axisLine={false} tickLine={false} tick={{fontSize: 11}} />
+                  <Tooltip />
+                  <ReferenceLine x={0} stroke="#000" strokeWidth={1} />
+                  <Bar dataKey="valor" radius={[0, 4, 4, 0]}>
+                    {dados.lucroReal.map((entry, index) => (
+                      <Cell key={index} fill={entry.valor < 0 ? COLORS.danger : COLORS.primary} />
+                    ))}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+            {dados.lucroReal.some(v => v.valor < 0) && (
+              <div className="mt-4 p-3 bg-red-50 text-red-700 text-xs rounded-lg border border-red-100">
+                ⚠️ <strong>Atenção:</strong> Serviços em vermelho estão com custos superiores à receita.
               </div>
-            </div>
+            )}
           </div>
+        </section>
 
-          <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
-            {/* Ranking de procedimentos */}
-            <div className="bg-white rounded-xl border border-gray-200 p-5">
-              <p className="text-sm font-medium text-gray-700 mb-4">Procedimentos mais rentáveis</p>
-              {ranking.length === 0 ? (
-                <p className="text-sm text-gray-400">Sem dados neste mês.</p>
-              ) : (
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr className="text-gray-400 border-b border-gray-100">
-                      <th className="text-left pb-2">Procedimento</th>
-                      <th className="text-right pb-2">Qtd</th>
-                      <th className="text-right pb-2">Receita</th>
-                      <th className="text-right pb-2">Lucro</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {ranking.map((r, i) => (
-                      <tr key={i} className="border-b border-gray-50 last:border-0">
-                        <td className="py-1.5 text-gray-700">{r.procedimento}</td>
-                        <td className="py-1.5 text-right text-gray-500">{r.quantidade}</td>
-                        <td className="py-1.5 text-right text-gray-700">{fmt(r.receita_total)}</td>
-                        <td className={`py-1.5 text-right font-medium ${Number(r.lucro_total) >= 0 ? 'text-green-700' : 'text-red-600'}`}>
-                          {fmt(r.lucro_total)}
-                        </td>
-                      </tr>
+        {/* GRÁFICO 4 — Rendimento Equipe */}
+        <section>
+          <h2 className="text-[13px] font-medium text-gray-400 uppercase tracking-widest border-b pb-2 mb-4">Gráfico 4 — Rendimento líquido por funcionária</h2>
+          <div className="bg-white border border-gray-100 rounded-xl p-5">
+            <div className="h-64">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={dados.rendimentoEquipe}>
+                  <XAxis dataKey="nome" axisLine={false} tickLine={false} />
+                  <YAxis hide />
+                  <Tooltip />
+                  <Bar dataKey="valor" radius={[4, 4, 0, 0]} label={{ position: 'top', fontSize: 11 }}>
+                    {dados.rendimentoEquipe.map((entry, index) => (
+                      <Cell key={index} fill={entry.nome === 'Teta' ? COLORS.teta : COLORS.primary} />
                     ))}
-                  </tbody>
-                </table>
-              )}
-            </div>
-
-            {/* Rendimento por profissional */}
-            <div className="bg-white rounded-xl border border-gray-200 p-5">
-              <p className="text-sm font-medium text-gray-700 mb-4">Rendimento por profissional</p>
-              {rendimento.length === 0 ? (
-                <p className="text-sm text-gray-400">Sem dados neste mês.</p>
-              ) : (
-                <table className="w-full text-xs">
-                  <thead>
-                    <tr className="text-gray-400 border-b border-gray-100">
-                      <th className="text-left pb-2">Nome</th>
-                      <th className="text-right pb-2">Atend.</th>
-                      <th className="text-right pb-2">Receita</th>
-                      <th className="text-right pb-2">Total</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {rendimento.map((r, i) => (
-                      <tr key={i} className="border-b border-gray-50 last:border-0">
-                        <td className="py-1.5 text-gray-700">{r.profissional}</td>
-                        <td className="py-1.5 text-right text-gray-500">{r.total_atendimentos}</td>
-                        <td className="py-1.5 text-right text-gray-700">{fmt(r.receita_gerada)}</td>
-                        <td className="py-1.5 text-right font-medium text-gray-800">{fmt(r.rendimento_total)}</td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              )}
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
             </div>
           </div>
+        </section>
 
-          {/* Home Car + Paralelos */}
-          <div className="grid grid-cols-2 gap-4 mb-6">
-            <div className="bg-white rounded-xl border border-gray-200 p-5">
-              <p className="text-xs text-gray-500 mb-1">Receita Home Car</p>
-              <p className="text-xl font-semibold text-gray-800">{fmt(dados?.receita_homecare)}</p>
-              <p className="text-xs text-yellow-600 mt-1">Pendente: {fmt(dados?.pendente_homecare)}</p>
-            </div>
-            <div className="bg-white rounded-xl border border-gray-200 p-5">
-              <p className="text-xs text-gray-500 mb-1">Receita Paralelos</p>
-              <p className="text-xl font-semibold text-gray-800">{fmt(dados?.receita_paralelos)}</p>
-              <p className="text-xs text-yellow-600 mt-1">Pendente: {fmt(dados?.pendente_paralelos)}</p>
+        {/* GRÁFICO 5 — Possível vs Real */}
+        <section>
+          <h2 className="text-[13px] font-medium text-gray-400 uppercase tracking-widest border-b pb-2 mb-4">Gráfico 5 — Lucro possível vs real</h2>
+          <div className="bg-white border border-gray-100 rounded-xl p-5 flex items-center">
+            <div className="h-48 w-full">
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={dados.comparativoGeral} barSize={60}>
+                  <XAxis dataKey="label" axisLine={false} tickLine={false} />
+                  <YAxis hide />
+                  <Tooltip />
+                  <Bar dataKey="valor" radius={[6, 6, 0, 0]}>
+                    <Cell fill={COLORS.primary} />
+                    <Cell fill={COLORS.teta} />
+                  </Bar>
+                </BarChart>
+              </ResponsiveContainer>
             </div>
           </div>
+        </section>
 
-          {/* Pendentes */}
-          {pendentes.length > 0 && (
-            <div className="bg-white rounded-xl border border-gray-200 p-5">
-              <p className="text-sm font-medium text-gray-700 mb-4">
-                Clientes pendentes — executado mas não pago ({pendentes.length})
-              </p>
-              <table className="w-full text-xs">
-                <thead>
-                  <tr className="text-gray-400 border-b border-gray-100">
-                    <th className="text-left pb-2">Cliente</th>
-                    <th className="text-left pb-2">Procedimento</th>
-                    <th className="text-left pb-2">Horário</th>
-                    <th className="text-right pb-2">Valor</th>
-                    <th className="text-right pb-2">Ação</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {pendentes.map((p, i) => (
-                    <tr key={i} className="border-b border-gray-50 last:border-0">
-                      <td className="py-1.5 text-gray-700 font-medium">{p.cliente}</td>
-                      <td className="py-1.5 text-gray-500">{p.procedimentos?.nome}</td>
-                      <td className="py-1.5 text-gray-400">{p.horario?.slice(0,5)}</td>
-                      <td className="py-1.5 text-right font-medium text-yellow-700">{fmt(p.valor_cobrado)}</td>
-                      <td className="py-1.5 text-right">
-                        <button
-                          onClick={async () => {
-                            await supabase.from('atendimentos').update({ pago: true }).eq('id', p.id);
-                            carregar();
-                          }}
-                          className="text-xs bg-green-100 text-green-700 px-2 py-1 rounded hover:bg-green-200 font-bold"
-                        >
-                          Marcar pago
-                        </button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </>
-      )}
+      </div>
     </div>
   );
-}
+};
+
+export default Dashboard;

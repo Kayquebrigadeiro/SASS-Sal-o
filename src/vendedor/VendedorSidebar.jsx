@@ -32,6 +32,13 @@ export default function VendedorSidebar({ email }) {
             }`}>
           + Novo Salão
         </NavLink>
+        <NavLink to="/admin/admins"
+          className={({ isActive }) =>
+            `block px-3 py-2 rounded-lg text-sm transition-colors ${
+              isActive ? 'bg-white text-slate-900 font-medium' : 'text-slate-400 hover:bg-slate-800 hover:text-white'
+            }`}>
+          Admins
+        </NavLink>
       </nav>
 
       <div className="px-4 py-4 border-t border-slate-700">
